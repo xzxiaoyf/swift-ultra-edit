@@ -2,6 +2,54 @@ import AppKit
 
 // MARK: - 通用工具
 
+/// 分阶段计时（设置 SUE_BENCH=/path/file.log 时启用），用于定位加载卡顿
+enum Bench {
+    /// 启用条件：环境变量 SUE_BENCH 指定日志路径，或存在 /tmp/sue_bench.on 标记文件
+    /// （通过访达 / open 启动时无法注入环境变量，故提供标记文件方式）
+    static var path: String? {
+        if let p = ProcessInfo.processInfo.environment["SUE_BENCH"] { return p }
+        if FileManager.default.fileExists(atPath: "/tmp/sue_bench.on") { return "/tmp/sue_bench.log" }
+        return nil
+    }
+
+    static func mark(_ label: String) {
+        guard let p = path else { return }
+        let text = String(format: "%.3f %@\n", Date().timeIntervalSince1970, label)
+        if let handle = FileHandle(forWritingAtPath: p) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: URL(fileURLWithPath: p))
+        }
+    }
+
+    @discardableResult
+    static func measure<T>(_ label: String, _ body: () -> T) -> T {
+        guard path != nil else { return body() }
+        let t0 = Date()
+        let result = body()
+        let ms = Date().timeIntervalSince(t0) * 1000
+        mark(String(format: "%@ 耗时 %.1f ms", label, ms))
+        return result
+    }
+
+    /// 主线程心跳：每秒尝试一次主队列派发，记录响应延迟，用于判断界面是否卡死
+    static func startWatchdog() {
+        guard path != nil else { return }
+        DispatchQueue.global().async {
+            while true {
+                Thread.sleep(forTimeInterval: 1.0)
+                let sent = Date()
+                DispatchQueue.main.async {
+                    let lag = Date().timeIntervalSince(sent) * 1000
+                    mark(String(format: "心跳 主线程响应延迟 %.0f ms", lag))
+                }
+            }
+        }
+    }
+}
+
 func formatByteCount(_ bytes: Int64) -> String {
     let f = ByteCountFormatter()
     f.countStyle = .file
@@ -30,6 +78,38 @@ func sanitizeForDisplay(_ s: String) -> String {
         }
     }
     return out
+}
+
+/// 判断文本中是否存在超长行（提前退出，避免全文统计）。
+/// 用于识别"没有换行"的大文件——此类文件若按不换行排版，
+/// NSTextView 会被撑成数百万点宽，导致界面长时间无响应。
+func textHasLineLongerThan(_ text: String, limit: Int) -> Bool {
+    guard limit > 0 else { return false }
+    var run = 0
+    for scalar in text.unicodeScalars {
+        if scalar == "\n" || scalar == "\r" {
+            run = 0
+        } else {
+            run += 1
+            if run > limit { return true }
+        }
+    }
+    return false
+}
+
+/// 文本中最长行的字符数（用于状态提示，最多扫描 limit 个字符即退出）
+func textLongestLineLength(_ text: String) -> Int {
+    var longest = 0
+    var run = 0
+    for scalar in text.unicodeScalars {
+        if scalar == "\n" || scalar == "\r" {
+            longest = max(longest, run)
+            run = 0
+        } else {
+            run += 1
+        }
+    }
+    return max(longest, run)
 }
 
 func alertError(title: String, message: String) {

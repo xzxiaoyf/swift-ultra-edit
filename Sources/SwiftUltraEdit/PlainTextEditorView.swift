@@ -1,5 +1,24 @@
 import AppKit
 
+/// NSTextView 子类：仅在诊断模式（Bench 开启）下统计排版/绘制耗时
+final class TimedTextView: NSTextView {
+    override func layout() {
+        guard Bench.path != nil else { super.layout(); return }
+        let t0 = Date()
+        super.layout()
+        let ms = Date().timeIntervalSince(t0) * 1000
+        if ms > 50 { Bench.mark(String(format: "textView.layout %.0f ms 高 %.0f", ms, frame.height)) }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard Bench.path != nil else { super.draw(dirtyRect); return }
+        let t0 = Date()
+        super.draw(dirtyRect)
+        let ms = Date().timeIntervalSince(t0) * 1000
+        if ms > 50 { Bench.mark(String(format: "textView.draw %.0f ms", ms)) }
+    }
+}
+
 /// 常规文本编辑器后端（基于 NSTextView），适用于中小文件，支持完整编辑能力。
 final class PlainTextEditorView: NSView, NSTextViewDelegate {
 
@@ -27,7 +46,7 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
     // MARK: - 初始化
 
     override init(frame frameRect: NSRect) {
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        textView = TimedTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         super.init(frame: frameRect)
         setup()
     }
@@ -75,6 +94,11 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
         textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                                        height: CGFloat.greatestFiniteMagnitude)
+        // 说明：不要开启 allowsNonContiguousLayout。
+        // 对"单段超长文本"（如无换行的 GPX/压缩 JSON），非连续排版在首次布局时
+        // 会反复补算缺失的分片，实测把 367 KB 单行的首屏排版从约 0.2 秒放大到 3 秒以上，
+        // 表现为打开文件后界面长时间无响应。
+        textView.layoutManager?.allowsNonContiguousLayout = false
 
         // 注意：必须先添加 gutter、后添加 scrollView。
         // macOS 26 上，layer-backed 容器中若先添加 NSScrollView 再添加兄弟视图，
@@ -99,23 +123,49 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
     }
 
     override func layout() {
+        let t0 = Date()
         super.layout()
+        let tSuper = Date().timeIntervalSince(t0) * 1000
         let gw = gutterWidth
         gutter.frame = NSRect(x: 0, y: 0, width: gw, height: bounds.height)
-        scrollView.frame = NSRect(x: gw, y: 0, width: max(0, bounds.width - gw), height: bounds.height)
+        let t1 = Date()
+        let targetW = max(0, bounds.width - gw)
+        if abs(textView.frame.width - targetW) > 1, wrapsLongLines {
+            textView.setFrameSize(NSSize(width: targetW, height: max(1, textView.frame.height)))
+        }
+        let tFrame = Date().timeIntervalSince(t1) * 1000
+        scrollView.frame = NSRect(x: gw, y: 0, width: targetW, height: bounds.height)
+        let tScroll = Date().timeIntervalSince(t1) * 1000
         gutter.needsDisplay = true
+        let ms = Date().timeIntervalSince(t0) * 1000
+        if ms > 100 {
+            Bench.mark(String(format: "layout 耗时 %.0f ms（super %.0f / setFrame %.0f / scrollView %.0f）文本高 %.0f",
+                              ms, tSuper, tFrame, tScroll, textView.frame.height))
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let t0 = Date()
+        super.draw(dirtyRect)
+        let ms = Date().timeIntervalSince(t0) * 1000
+        if ms > 100 { Bench.mark(String(format: "编辑器绘制耗时 %.0f ms", ms)) }
     }
 
     // MARK: - 对外接口
 
     func setText(_ text: String) {
+        Bench.mark("setText: 赋值前 字符数=\(text.count)")
         textView.string = text
+        Bench.mark("setText: 字符串已赋值")
         textView.undoManager?.removeAllActions()
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         textView.scroll(NSPoint(x: 0, y: 0))
+        Bench.mark("setText: 选择与滚动完成")
         rebuildLineStarts()
+        Bench.mark("setText: 行首索引完成 行数=\(lineStarts.count)")
         updateGutterWidth()
         highlightNow(full: true)
+        Bench.mark("setText: 高亮完成")
         needsLayout = true
     }
 
@@ -135,6 +185,36 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
         highlightNow(full: true)
         needsDisplay = true
         gutter.needsDisplay = true
+    }
+
+    /// 是否启用自动换行（超长行文件必须开启，否则文本视图会被撑到数百万点宽）
+    private(set) var wrapsLongLines = false
+
+    /// 切换自动换行。开启时文本容器宽度跟随视图宽度，关闭时恢复横向无限宽（可横向滚动）。
+    /// - Parameter width: 预估可用宽度；视图尚未布局时可避免按 0 宽度排版造成二次重排。
+    func setWrapping(_ on: Bool, width: CGFloat = 0) {
+        guard on != wrapsLongLines else { return }
+        wrapsLongLines = on
+        guard let tc = textView.textContainer else { return }
+
+        if on {
+            let target = max(320, width > 0 ? width : scrollView.frame.width - textView.textContainerInset.width * 2)
+            textView.isHorizontallyResizable = false
+            if textView.frame.width < 100 {
+                textView.frame = NSRect(x: 0, y: 0, width: target, height: max(1, textView.frame.height))
+            }
+            tc.widthTracksTextView = true
+            tc.containerSize = NSSize(width: target, height: CGFloat.greatestFiniteMagnitude)
+        } else {
+            tc.widthTracksTextView = false
+            tc.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                      height: CGFloat.greatestFiniteMagnitude)
+            textView.isHorizontallyResizable = true
+        }
+        textView.needsLayout = true
+        textView.needsDisplay = true
+        gutter.needsDisplay = true
+        needsLayout = true
     }
 
     // MARK: - 语法高亮
@@ -163,7 +243,11 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
         guard length > 0 else { return }
 
         var range: NSRange? = nil
-        if !(full && length <= SyntaxHighlighter.fullHighlightLimit) {
+        // 超长行文档（如无换行的 GPX / 压缩 JSON）即使字符数未超阈，也不能全文着色：
+        // 全文上色会产生数万个属性 run（同色连续的属性区段），TextKit 按 run 排版，
+        // 首屏排版会从约 0.2 秒恶化到数秒。此类文档只给可视区域着色。
+        let longLineDoc = wrapsLongLines && length > 20_000
+        if longLineDoc || !(full && length <= SyntaxHighlighter.fullHighlightLimit) {
             // 超大文本只处理可视区域
             range = visibleCharacterRange()
         }
@@ -197,19 +281,13 @@ final class PlainTextEditorView: NSView, NSTextViewDelegate {
     }
 
     func currentLineAndColumn() -> (Int, Int) {
+        // 用行首索引二分查找：单行超长文件下行号栏每次重绘都调用此方法，
+        // 逐行 lineRange 扫描会退化为 O(n²)。
+        guard !lineStarts.isEmpty else { return (1, 1) }
         let loc = textView.selectedRange().location
-        let ns = textView.string as NSString
-        var line = 1
-        var lineStart = 0
-        var idx = 0
-        while idx < loc && idx < ns.length {
-            let r = ns.lineRange(for: NSRange(location: idx, length: 0))
-            let next = r.location + r.length
-            if next <= idx { break }
-            if next <= loc { line += 1; lineStart = next }
-            idx = next
-        }
-        return (line, loc - lineStart + 1)
+        let line = lineNumber(forCharacterIndex: loc)
+        let start = lineStarts[min(max(0, line - 1), lineStarts.count - 1)]
+        return (line, max(1, loc - start + 1))
     }
 
     func selectedText() -> String {
@@ -310,6 +388,11 @@ final class LineNumberGutter: NSView {
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
+        let t0 = Date()
+        defer {
+            let ms = Date().timeIntervalSince(t0) * 1000
+            if ms > 50 { Bench.mark(String(format: "行号栏绘制 %.0f ms", ms)) }
+        }
         Theme.gutterBackground.setFill()
         dirtyRect.fill()
 

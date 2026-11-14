@@ -46,6 +46,21 @@ final class EditorViewController: NSViewController {
     }()
     private let largeThreshold: Int64 = 16 * 1024 * 1024
 
+    /// 超长行阈值：单行超过该字符数时自动启用换行显示。
+    /// 依据：不换行排版会把文本视图撑到数百万点宽（367 KB 单行 ≈ 318 万点），
+    /// 触发巨型位图图层重绘，界面长时间无响应。
+    private let longLineThreshold = 5_000
+
+    /// 用户是否允许对超长行自动换行（默认开启，可菜单切换）
+    private(set) var wrapLongLinesPreferred: Bool = {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "SUEWrapLongLines") == nil { return true }
+        return defaults.bool(forKey: "SUEWrapLongLines")
+    }()
+
+    /// 当前文档是否正在以换行方式显示
+    private(set) var currentDocumentWrapped = false
+
     // MARK: - 语法高亮状态
 
     /// 用户手动指定的语言（nil 表示自动检测）
@@ -231,6 +246,7 @@ final class EditorViewController: NSViewController {
         hexSource = nil
         smallFileData = nil
         dirty = false
+        currentDocumentWrapped = false
         statusRight.stringValue = ""
     }
 
@@ -281,14 +297,18 @@ final class EditorViewController: NSViewController {
 
     func open(url: URL) {
         guard confirmDiscardIfNeeded() else { return }
+        Bench.mark("open: 开始 \(url.lastPathComponent)")
         currentURL = url
         isUntitled = false
         mode = .text
         modeControl.selectedSegment = 0
         syntaxOverride = nil
         loadCurrent()
+        Bench.mark("open: loadCurrent 返回")
         view.window?.makeFirstResponder(nil)
+        Bench.mark("open: 取消第一响应者")
         focusEditor()
+        Bench.mark("open: 聚焦编辑器完成")
     }
 
     private func focusEditor() {
@@ -324,6 +344,7 @@ final class EditorViewController: NSViewController {
     }
 
     private func loadText(url: URL) {
+        Bench.mark("loadText 开始 size=\(currentSize)")
         if currentSize > largeThreshold {
             beginLargeMode(url: url)
             return
@@ -333,33 +354,44 @@ final class EditorViewController: NSViewController {
             alertError(title: "无法读取文件", message: url.path)
             return
         }
+        Bench.mark("已读取 \(data.count) 字节")
 
         if EncodingDetector.looksBinary(data) {
             switchToHexBecauseBinary(url: url)
             return
         }
+        Bench.mark("二进制判定完成")
 
         let detected = EncodingDetector.detect(data: data)
+        Bench.mark("编码探测完成 \(detected.kind.displayName)")
         guard let text = EncodingCodec.decode(data, as: detected.kind) else {
             switchToHexBecauseBinary(url: url)
             return
         }
+        Bench.mark("解码完成 字符数=\(text.count)")
 
         smallFileData = data
         smallEncoding = detected.kind
         smallHasBOM = detected.hasBOM
 
         currentLanguage = resolveLanguage(for: url)
+        currentDocumentWrapped = wrapLongLinesPreferred && textHasLineLongerThan(text, limit: longLineThreshold)
         let v = PlainTextEditorView(frame: .zero)
         v.setFontSize(fontSize)
+        let estimatedWidth = max(320, container.bounds.width - 60 - 16)
+        v.setWrapping(currentDocumentWrapped, width: estimatedWidth)
+        Bench.mark("视图创建完成 换行=\(currentDocumentWrapped) 预估宽=\(Int(estimatedWidth))")
         v.setText(text)
+        Bench.mark("setText 返回")
         v.setLanguage(currentLanguage)
+        Bench.mark("setLanguage 返回")
         v.onTextChanged = { [weak self] in self?.markDirty() }
         v.onSelectionChanged = { [weak self] line, col in
             self?.statusRight.stringValue = "行 \(line) : 列 \(col)"
         }
         plainView = v
         install(v)
+        Bench.mark("install 完成")
         selectEncodingInPopup(detected.kind)
         statusLeft.stringValue = "文本模式 · \(detected.kind.displayName) · \(detected.hasBOM ? "含 BOM" : "无 BOM") · \(formatByteCount(currentSize)) · \(v.lineStarts.count) 行" + languageSuffix()
     }
@@ -459,6 +491,9 @@ final class EditorViewController: NSViewController {
         }
         if mode == .text, syntaxEnabled, currentLanguage != .none {
             parts.append("语法 \(currentLanguage.displayName)")
+        }
+        if mode == .text, currentDocumentWrapped {
+            parts.append("自动换行")
         }
         parts.append(formatByteCount(currentSize))
         if dirty {
@@ -746,6 +781,30 @@ final class EditorViewController: NSViewController {
         plainView?.setFontSize(fontSize)
         largeView?.setFontSize(fontSize)
         hexView?.setFontSize(fontSize)
+    }
+
+    // MARK: - 自动换行
+
+    /// 切换「超长行自动换行」偏好（影响此后打开的文件）
+    func toggleLineWrapping() {
+        wrapLongLinesPreferred.toggle()
+        UserDefaults.standard.set(wrapLongLinesPreferred, forKey: "SUEWrapLongLines")
+        if !wrapLongLinesPreferred, let v = plainView,
+           textHasLineLongerThan(v.text, limit: longLineThreshold) {
+            flashMessage("当前文件含超长行，保持换行显示以免卡顿；设置已对后续文件生效")
+            return
+        }
+        applyLineWrapping()
+        flashMessage(wrapLongLinesPreferred ? "超长行自动换行：开启" : "超长行自动换行：关闭")
+    }
+
+    private func applyLineWrapping() {
+        guard let v = plainView else { return }
+        let need = wrapLongLinesPreferred && textHasLineLongerThan(v.text, limit: longLineThreshold)
+        guard need != currentDocumentWrapped else { return }
+        currentDocumentWrapped = need
+        v.setWrapping(need)
+        updateStatus()
     }
 
     // MARK: - 语法高亮

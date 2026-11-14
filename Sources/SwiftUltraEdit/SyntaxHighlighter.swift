@@ -101,7 +101,8 @@ enum SyntaxLanguage: String, CaseIterable {
         case "go": return .go
         case "rs": return .rust
         case "css", "scss", "sass", "less": return .css
-        case "html", "htm", "xhtml", "xml", "svg", "plist", "storyboard", "xib": return .html
+        case "html", "htm", "xhtml", "xml", "svg", "plist", "storyboard", "xib",
+             "gpx", "tcx", "kml", "rss", "atom", "xsl", "xslt", "xsd", "dtd", "fxml": return .html
         case "sql", "ddl", "dml": return .sql
         case "yml", "yaml": return .yaml
         case "ini", "cfg", "conf", "toml", "properties", "env": return .ini

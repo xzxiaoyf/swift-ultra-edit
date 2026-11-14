@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var syntaxMenu: NSMenu?
     private var syntaxToggleItem: NSMenuItem?
     private var syntaxLanguageItems: [NSMenuItem] = []
+    private var wrapToggleItem: NSMenuItem?
 
     // MARK: - 生命周期
 
@@ -16,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Bench.startWatchdog()
         let wc = MainWindowController()
         mainWindowController = wc
         wc.showWindow(nil)
@@ -48,6 +50,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.captureWindow(to: path)
             }
+        }
+
+        // 应用启动前已缓存的"打开方式"文件事件
+        if !pendingOpenURLs.isEmpty {
+            diagLog("窗口就绪，处理缓存的 \(pendingOpenURLs.count) 个待打开文件")
+            let urls = pendingOpenURLs
+            pendingOpenURLs = []
+            handleOpen(urls: urls)
         }
     }
 
@@ -130,10 +140,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return editor.confirmDiscardIfNeeded() ? .terminateNow : .terminateCancel
     }
 
+    func application(_ sender: NSApplication, open urls: [URL]) {
+        diagLog("application(open:) 调用，共 \(urls.count) 个文件，窗口控制器存在=\(mainWindowController != nil)")
+        handleOpen(urls: urls)
+    }
+
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
-        mainWindowController?.editor.open(url: URL(fileURLWithPath: filename))
-        mainWindowController?.window?.makeKeyAndOrderFront(nil)
+        diagLog("application(openFile:) 调用，窗口控制器存在=\(mainWindowController != nil)")
+        handleOpen(urls: [URL(fileURLWithPath: filename)])
         return true
+    }
+
+    /// 诊断输出（设置 SUE_DIAG=/path/file.log 环境变量时启用）
+    private func diagLog(_ line: String) {
+        guard let path = ProcessInfo.processInfo.environment["SUE_DIAG"] else { return }
+        let text = "\(Date()) \(line)\n"
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(text.data(using: .utf8)!)
+            try? handle.close()
+        } else {
+            try? text.data(using: .utf8)!.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
+    /// 访达"打开方式"可能在 applicationDidFinishLaunching 之前派发文件事件，
+    /// 此时主窗口尚未创建——先缓存，等窗口就绪后再打开。
+    private var pendingOpenURLs: [URL] = []
+
+    private func handleOpen(urls: [URL]) {
+        diagLog("handleOpen: wc=\(mainWindowController != nil) urls=\(urls.map { $0.lastPathComponent })")
+        guard let editor = mainWindowController?.editor else {
+            pendingOpenURLs.append(contentsOf: urls)
+            diagLog("窗口未就绪，已缓存 \(pendingOpenURLs.count) 个待打开文件")
+            return
+        }
+        if let first = urls.first {
+            editor.open(url: first)
+        }
+        mainWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - 菜单动作
@@ -204,6 +250,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleSyntaxAction(_ sender: Any?) {
         editor?.toggleSyntaxHighlighting()
+    }
+
+    @objc private func toggleWrapAction(_ sender: Any?) {
+        editor?.toggleLineWrapping()
     }
 
     @objc private func autoDetectLanguageAction(_ sender: Any?) {
@@ -320,6 +370,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleSyntax.target = self
         syntaxToggleItem = toggleSyntax
 
+        let wrapItem = viewMenu.addItem(withTitle: "超长行自动换行",
+                                        action: #selector(toggleWrapAction(_:)),
+                                        keyEquivalent: "w")
+        wrapItem.keyEquivalentModifierMask = [.command, .option]
+        wrapItem.target = self
+        wrapToggleItem = wrapItem
+
         let languageRoot = NSMenuItem(title: "语法语言", action: nil, keyEquivalent: "")
         let languageMenu = NSMenu(title: "语法语言")
         languageMenu.delegate = self
@@ -373,6 +430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         syntaxToggleItem?.state = (editor?.syntaxEnabled ?? true) ? .on : .off
+        wrapToggleItem?.state = (editor?.wrapLongLinesPreferred ?? true) ? .on : .off
         let current = editor?.currentLanguage
         let isAuto = editor?.usesAutoSyntax ?? true
         for item in syntaxLanguageItems {

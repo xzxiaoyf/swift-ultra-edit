@@ -51,6 +51,18 @@ final class TextCanvasView: NSView {
 
     private var font: NSFont { Theme.codeFont(size: fontSize) }
 
+    /// 单行最多绘制的字符数。超长行（如无换行的 GPX/压缩 JSON）整行绘制会让
+    /// NSString.draw 排版整行，滚动时反复重排导致界面卡死，故截断显示。
+    private let maxDisplayCharsPerLine = 8_000
+
+    private func displayText(forLine line: Int) -> String {
+        let raw = document.lineText(line)
+        guard raw.count > maxDisplayCharsPerLine else { return sanitizeForDisplay(raw) }
+        let head = String(raw.prefix(maxDisplayCharsPerLine))
+        return sanitizeForDisplay(head)
+            + "   … 本行共 \(raw.count) 字符（仅显示前 \(maxDisplayCharsPerLine) 字符，按 ⌘E 编辑整行）"
+    }
+
     init(document: TextDocument) {
         self.document = document
         super.init(frame: NSRect(x: 0, y: 0, width: 3000, height: 100))
@@ -123,8 +135,7 @@ final class TextCanvasView: NSView {
                 rowRect.fill()
             }
 
-            let raw = document.lineText(line)
-            let display = sanitizeForDisplay(raw)
+            let display = displayText(forLine: line)
             let ns = display as NSString
             let drawRect = NSRect(x: textInsetX,
                                   y: rowRect.minY + (lineHeight - font.pointSize * 1.35) / 2,
@@ -204,7 +215,7 @@ final class TextCanvasView: NSView {
     }
 
     func caretRect(line: Int, column: Int) -> NSRect {
-        let text = sanitizeForDisplay(document.lineText(line))
+        let text = displayText(forLine: line)
         let chars = Array(text)
         let col = min(max(0, column), chars.count)
         let prefix = String(chars.prefix(col))
@@ -274,7 +285,7 @@ final class TextCanvasView: NSView {
     }
 
     private func columnIndex(at point: NSPoint, line: Int) -> Int {
-        let text = sanitizeForDisplay(document.lineText(line))
+        let text = displayText(forLine: line)
         let chars = Array(text)
         let x = point.x - textInsetX
         if x <= 0 { return 0 }
@@ -418,7 +429,8 @@ final class TextCanvasView: NSView {
     }
 
     private func charCount(_ line: Int) -> Int {
-        return document.lineText(line).count
+        // 超长行只按可见字符数计算，避免每次按键都读取整行（如 16MB 单行）
+        return min(document.lineText(line).count, maxDisplayCharsPerLine)
     }
 
     func moveCaret(toLine line: Int, column: Int) {

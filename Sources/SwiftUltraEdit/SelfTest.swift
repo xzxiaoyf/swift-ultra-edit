@@ -29,6 +29,7 @@ enum SelfTest {
         testHexSource(tmpDir)
         testLargeFile()
         testSyntaxHighlighting()
+        testLongLines()
 
         print("---------------------------------------")
         print("通过 \(passes) 项，失败 \(failures) 项")
@@ -264,6 +265,33 @@ enum SelfTest {
         }
     }
 
+    // MARK: - 超长行（无换行文件）
+
+    private static func testLongLines() {
+        print("\n[超长行]")
+
+        let normal = "第一行\n第二行\n第三行\n"
+        check(!textHasLineLongerThan(normal, limit: 5000), "普通换行文本不触发超长行")
+        check(textLongestLineLength(normal) == 3, "最长行长度统计正确", "\(textLongestLineLength(normal))")
+
+        let single = "<?xml version=\"1.0\"?>\n" + String(repeating: "<trkpt lat=\"34.2\" lon=\"117.1\"/>", count: 10_000) + "\n</gpx>"
+        check(textHasLineLongerThan(single, limit: 5000), "十万字符单行触发超长行")
+        check(!textHasLineLongerThan(single, limit: 1_000_000), "阈值高于行长时不触发")
+        check(textLongestLineLength(single) > 300_000, "最长行长度超过 30 万", "\(textLongestLineLength(single))")
+
+        // 换行开关：开启后容器宽度跟随视图（避免被撑到数百万点宽）
+        _ = NSApplication.shared
+        let v = PlainTextEditorView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        check(!v.wrapsLongLines, "默认不启用换行")
+        v.setWrapping(true, width: 884)
+        check(v.wrapsLongLines, "换行开关生效")
+        check(v.textView.textContainer?.widthTracksTextView == true, "换行后容器宽度跟随视图")
+        check(!v.textView.isHorizontallyResizable, "换行后不横向伸缩")
+        v.setWrapping(false)
+        check(v.textView.textContainer?.widthTracksTextView == false, "关闭换行恢复无限宽")
+        check(v.textView.isHorizontallyResizable, "关闭换行恢复横向滚动")
+    }
+
     // MARK: - 语法高亮
 
     private static func kind(of needle: String, in text: String, tokens: [SyntaxToken]) -> TokenKind? {
@@ -283,8 +311,17 @@ enum SelfTest {
         check(SyntaxLanguage.detect(url: URL(fileURLWithPath: "/tmp/a.php")) == .php, "探测 .php 为 PHP")
         check(SyntaxLanguage.detect(url: URL(fileURLWithPath: "/tmp/a.sh")) == .shell, "探测 .sh 为 Shell")
         check(SyntaxLanguage.detect(url: URL(fileURLWithPath: "/tmp/a.unknown")) == .none, "未知扩展名回落纯文本")
+        check(SyntaxLanguage.detect(url: URL(fileURLWithPath: "/tmp/a.gpx")) == .html, "探测 .gpx 为 XML")
+        check(SyntaxLanguage.detect(url: URL(fileURLWithPath: "/tmp/a.bird.json")) == .json, "探测 a.bird.json 为 JSON")
         check(SyntaxLanguage.detectShebang("#! /usr/bin/env python3\nprint(1)") == .python, "shebang 识别 Python")
         check(SyntaxLanguage.detectShebang("#!/bin/bash\necho hi") == .shell, "shebang 识别 Shell")
+
+        // XML / GPX 标记高亮
+        let xml = "<gpx version=\"1.0\">\n  <trk>\n    <name>徒步</name>\n  </trk>\n</gpx>"
+        let xmlTokens = SyntaxHighlighter.shared.tokens(in: xml, language: .html, range: nil)
+        check(kind(of: "<gpx", in: xml, tokens: xmlTokens) == .keyword, "XML 标签名着色")
+        check(kind(of: "\"1.0\"", in: xml, tokens: xmlTokens) == .string, "XML 属性值着色")
+        check(kind(of: "徒步", in: xml, tokens: xmlTokens) == nil, "XML 元素文本不着色")
 
         let py = """
         # 这是注释
